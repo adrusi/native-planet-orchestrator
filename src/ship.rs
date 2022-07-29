@@ -2,6 +2,7 @@ use anyhow::{Result, anyhow};
 use async_std::fs;
 use async_std::io;
 use async_std::path::{Path, PathBuf};
+use async_trait::async_trait;
 use libarchive::archive::ExtractOption;
 use log::error;
 use serde::{Deserialize, Serialize};
@@ -10,7 +11,9 @@ use std::fmt::Display;
 use uuid::Uuid;
 
 use crate::archive;
+use crate::async_util::AsyncDrop;
 use crate::filelock::FileLock;
+use crate::urbit::UrbitVersion;
 
 pub use harbor_private::{HARBOR, Harbor, HarborBuf};
 
@@ -161,25 +164,19 @@ fn find_extracted_pier(_unpack_path: &Path) -> Option<PathBuf> {
     todo!();
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 pub struct PierConfig {
-
+    runtime_version: UrbitVersion,
 }
 
-impl Default for PierConfig {
-    fn default() -> Self {
-        Self {  }
-    }
-}
-
-/// A Pier represents the data for an Urbit ship. Specifically it is a unique handle to the directory where all data for
-/// the particular ship is stored.
-/// The type system guarantees that there cannot be multiple Pier handles for the same directory, in order to prevent
-/// accidentally corrupting valuable user data.
+/// A PierState represents the data for an Urbit ship. Specifically it is a unique handle to the directory where all
+/// data for the particular ship is stored.
+/// The type system guarantees that there cannot be multiple PierState handles for the same directory, in order to
+/// prevent accidentally corrupting valuable user data.
 ///
-/// IMPORTANT: before letting a Pier go out of scope and be dropped, you must call `pier.finalize().await?`. The pier
-/// must do filesystem IO to release a lock, and async IO isn't possible with std::ops::Drop. The lock will still be
-/// released if you forget, but synchronously, blocking the whole thread and tanking performance.
+/// IMPORTANT: before letting a PierState go out of scope and be dropped, you must call `pier.async_drop().await`. The
+/// pier must do filesystem IO to release a lock, and async IO isn't possible with std::ops::Drop. The lock will still
+/// be released if you forget, but synchronously, blocking the whole thread and tanking performance.
 #[derive(Debug)]
 pub struct PierState {
     filelock: Option<FileLock>,
@@ -379,23 +376,6 @@ impl PierState {
         Ok(result)
     }
 
-    pub async fn finalize(&mut self) -> Result<()> {
-        match self.config {
-            None => {},
-            Some(ref config) => {
-                let config_buf = serde_json::to_vec(config)?;
-                fs::write(self.config_path(), &config_buf).await?;
-                self.config = None;
-            },
-        }
-
-        let filelock = self.filelock.take();
-        match filelock {
-            None => Ok(()),
-            Some(filelock) => filelock.release().await,
-        }
-    }
-
     pub fn config(&self) -> Option<&PierConfig> {
         self.config.as_ref()
     }
@@ -492,6 +472,26 @@ impl PierState {
         self.name = new_name;
 
         Ok(())
+    }
+}
+
+#[async_trait]
+impl AsyncDrop for PierState {
+    async fn async_drop_result(&mut self) -> Result<()> {
+        match self.config {
+            None => {},
+            Some(ref config) => {
+                let config_buf = serde_json::to_vec(config)?;
+                fs::write(self.config_path(), &config_buf).await?;
+                self.config = None;
+            },
+        }
+
+        let filelock = self.filelock.take();
+        match filelock {
+            None => Ok(()),
+            Some(filelock) => filelock.release().await,
+        }
     }
 }
 
