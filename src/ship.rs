@@ -1,19 +1,16 @@
-use anyhow::{Result, anyhow};
+#[allow(unused_imports)] use crate::prelude::*;
+
 use async_std::fs;
 use async_std::io;
 use async_std::path::{Path, PathBuf};
-use async_trait::async_trait;
 use libarchive::archive::ExtractOption;
-use log::error;
 use serde::{Deserialize, Serialize};
 use std::error::Error as StdError;
 use std::fmt::Display;
-use uuid::Uuid;
 
 use crate::archive;
-use crate::async_util::AsyncDrop;
 use crate::filelock::FileLock;
-use crate::urbit::UrbitVersion;
+use crate::urbit::Version;
 
 pub use harbor_private::{HARBOR, Harbor, HarborBuf};
 
@@ -166,7 +163,7 @@ fn find_extracted_pier(_unpack_path: &Path) -> Option<PathBuf> {
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 pub struct PierConfig {
-    runtime_version: UrbitVersion,
+    runtime_version: Version,
 }
 
 /// A PierState represents the data for an Urbit ship. Specifically it is a unique handle to the directory where all
@@ -193,11 +190,11 @@ impl PierState {
         path.push(name);
 
         if !path.is_dir().await {
-            return Err(anyhow!(
+            bail!(
                 "Pier '{}' does not exist in harbor port: {}",
                 name,
                 HARBOR.as_path().to_string_lossy(),
-            ))
+            )
         }
 
         let mut result = Self {
@@ -236,10 +233,10 @@ impl PierState {
 
         let filelock = FileLock::try_acquire(result.lockfile_path()).await?;
         if filelock.is_none() {
-            return Err(anyhow!(
+            bail!(
                 "Attempted to acquire multiple handles for the same pier: {}",
                 result.meta_path().to_string_lossy(),
-            ))
+            )
         }
 
         result.filelock = filelock;
@@ -451,16 +448,16 @@ impl PierState {
 
     pub async fn release_from_dry_dock(&mut self, new_name: String) -> Result<()> {
         if self.running {
-            return Err(anyhow!(
+            bail!(
                 "cannot release running ship from dry dock: {} (new name {})",
                 self.name, new_name,
-            ))
+            )
         }
         if !self.initialized {
-            return Err(anyhow!(
+            bail!(
                 "cannot release uninitialized ship from dry dock: {} (new name {})",
                 self.name, new_name,
-            ))
+            )
         }
 
         let src_path = self.meta_path();
@@ -500,7 +497,9 @@ impl Drop for PierState {
         match self.config {
             None => {},
             Some(ref config) => {
-                error!("PierState not finalized before being dropped, performing sync IO in async context to clean up");
+                log::error!(
+                    "PierState not finalized before being dropped, performing sync IO in async context to clean up"
+                );
 
                 let config_file = std::fs::OpenOptions::new()
                     .create(true)
@@ -511,7 +510,7 @@ impl Drop for PierState {
                 let config_file = match config_file {
                     Ok(f) => f,
                     Err(err) => {
-                        error!("encountered error during PierState cleanup: {}", err);
+                        log::error!("encountered error during PierState cleanup: {}", err);
                         return
                     },
                 };
@@ -519,7 +518,7 @@ impl Drop for PierState {
                 match serde_json::to_writer(config_file, config) {
                     Ok(_) => {},
                     Err(err) => {
-                        error!("encountered error during PierState cleanup: {}", err);
+                        log::error!("encountered error during PierState cleanup: {}", err);
                     }
                 }
             },

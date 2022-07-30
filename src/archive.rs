@@ -1,4 +1,5 @@
-use anyhow::Result;
+#[allow(unused_imports)] use crate::prelude::*;
+
 use async_std::path::PathBuf as APathBuf;
 use std::os::unix::prelude::OsStrExt;
 use std::path::Path as SPath;
