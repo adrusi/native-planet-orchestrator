@@ -31,7 +31,7 @@ impl FileLock {
         let path = path.to_owned();
 
         while path.exists().await {
-            tokio::time::sleep(tokio::time::Duration::from_millis(POLL_INTERVAL_MILLIS));
+            tokio::time::sleep(tokio::time::Duration::from_millis(POLL_INTERVAL_MILLIS)).await;
         }
 
         _ = fs::File::create(&path);
@@ -53,7 +53,12 @@ impl Drop for FileLock {
     fn drop(&mut self) {
         if !self.released {
             error!("programmer error: FileLock not released before being dropped; performing blocking IO in async context to release the lock");
-            std::fs::remove_file(self.path);
+            match std::fs::remove_file(&self.path) {
+                Ok(_) => {},
+                Err(e) => {
+                    error!("error encountered while releasing file lock: {}", e);
+                }
+            }
         }
     }
 }

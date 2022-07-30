@@ -43,8 +43,8 @@ impl<S: Stream> MyStreamExt for S {
     }
 }
 
-trait IntoResultAsRefBytes {
-    type Item: AsRef<Target = [u8]>;
+pub trait IntoResultAsRefBytes {
+    type Item: AsRef<[u8]>;
     fn into_result_asref_bytes(self) -> Result<Self::Item>;
 }
 
@@ -68,7 +68,7 @@ impl<A: IntoResultAsRefBytes, E> IntoResultAsRefBytes for std::result::Result<A,
     type Item = A::Item;
     fn into_result_asref_bytes(self) -> Result<Self::Item> {
         let byte = self?;
-        Ok(byte)
+        byte.into_result_asref_bytes()
     }
 }
 
@@ -94,7 +94,7 @@ impl<Src: Stream, D: Digest> ChecksumVerifyStream<Src, D> {
 }
 
 impl<A: IntoResultAsRefBytes, Src: Unpin + Stream<Item = A>, D: Digest> Stream for ChecksumVerifyStream<Src, D> {
-    type Item = Result<u8>;
+    type Item = Result<A::Item>;
 
     fn poll_next(
         self: std::pin::Pin<&mut Self>,
@@ -109,12 +109,16 @@ impl<A: IntoResultAsRefBytes, Src: Unpin + Stream<Item = A>, D: Digest> Stream f
 
         let res = ready!(this.src.as_mut().poll_next(cx));
 
-        Poll::Ready(match res.map(IntoResultAsRefBytes::into_result_asref_bytes) {
-            Some(Ok(b)) => {
-                digest.update(b.as_ref());
-                Some(Ok(b))
+        Poll::Ready(match res {
+            Some(b) => {
+                match b.into_result_asref_bytes() {
+                    Err(e) => Some(Err(e)),
+                    Ok(bytes) => {
+                        digest.update(bytes.as_ref());
+                        Some(Ok(bytes))
+                    },
+                }
             },
-            Some(Err(e)) => Some(Err(e)),
             None => {
                 let actual_checksum = this.digest.take().unwrap().finalize();
                 if &actual_checksum[..] == &this.checksum[..] {

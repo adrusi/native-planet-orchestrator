@@ -10,7 +10,7 @@ use std::fmt::Display;
 
 use crate::archive;
 use crate::filelock::FileLock;
-use crate::urbit::Version;
+use crate::runtime;
 
 pub use harbor_private::{HARBOR, Harbor, HarborBuf};
 
@@ -163,7 +163,7 @@ fn find_extracted_pier(_unpack_path: &Path) -> Option<PathBuf> {
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 pub struct PierConfig {
-    runtime_version: Version,
+    runtime_version: runtime::Version,
 }
 
 /// A PierState represents the data for an Urbit ship. Specifically it is a unique handle to the directory where all
@@ -241,7 +241,7 @@ impl PierState {
 
         result.filelock = filelock;
 
-        result.load_config();
+        result.load_config().await?;
 
         Ok(result)
     }
@@ -261,7 +261,7 @@ impl PierState {
             FileLock::acquire(result.lockfile_path()).await?
         );
 
-        result.load_config();
+        result.load_config().await?;
 
         Ok(result)
     }

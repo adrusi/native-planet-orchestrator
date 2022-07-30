@@ -221,7 +221,7 @@ impl Version {
     }
 
     pub fn binary_path(self) -> PathBuf {
-        let result = RUNTIME_HOME.clone();
+        let mut result = RUNTIME_HOME.clone();
         result.push(Path::new(&self.binary_name()));
         result
     }
@@ -232,8 +232,8 @@ impl Version {
             return Ok(());
         }
 
-        let instream = self.fetch().await?;
-        let outfile = fs::OpenOptions::new()
+        let mut instream = self.fetch().await?;
+        let mut outfile = fs::OpenOptions::new()
             .create_new(true)
             .write(true)
             .open(&binary_path)
@@ -254,45 +254,45 @@ impl Version {
         )
     }
 
-    fn translate_options(self, mut cmd: process::Command, options: &Options<'_>) -> Result<process::Command> {
+    fn translate_options(self, cmd: &mut process::Command, options: &Options<'_>) -> Result<()> {
         match options.new_pier {
-            Some(path) => cmd = cmd.arg("--pier").arg(path),
+            Some(path) => { cmd.arg("--pier").arg(path); },
             _ => {},
         }
         match options.keyfile {
-            Some(path) => cmd = cmd.arg("--key-file").arg(path),
+            Some(path) => { cmd.arg("--key-file").arg(path); },
             _ => {},
         }
         match options.name {
-            Some(name) => cmd = cmd.arg("--name").arg(name),
+            Some(name) => { cmd.arg("--name").arg(name); },
             _ => {},
         }
         match options.ames_port {
-            Some(port) => cmd = cmd.arg("--ames-port").arg(port),
+            Some(port) => { cmd.arg("--ames-port").arg(port.to_string()); },
             _ => {},
         }
         match options.http_port {
-            Some(port) => cmd = cmd.arg("--http-port").arg(port),
+            Some(port) => { cmd.arg("--http-port").arg(port.to_string()); },
             _ => {},
         }
         match options.tty {
-            Some(false) => cmd = cmd.arg("--no-tty"),
+            Some(false) => { cmd.arg("--no-tty"); },
             _ => {},
         }
         match options.existing_pier {
-            Some(path) => cmd = cmd.arg(path),
+            Some(path) => { cmd.arg(path); },
             _ => {},
         }
 
-        Ok(cmd)
+        Ok(())
     }
 
     pub async fn exec(self, options: &Options<'_>) -> Result<process::Child> {
         self.ensure_installed().await?;
 
-        let mut cmd = process::Command::new(self.binary_path())
-            .kill_on_drop(true);
-        cmd = self.translate_options(cmd, options);
+        let mut cmd = process::Command::new(self.binary_path());
+        self.translate_options(&mut cmd, options)?;
+        cmd.kill_on_drop(true);
 
         Ok(cmd.spawn()?)
     }
@@ -456,14 +456,14 @@ pub struct Options<'a> {
 
 impl<'a> Options<'a> {
     pub fn launch_existing_pier(pier: &'a Path) -> Self {
-        let result = Options::default();
+        let mut result = Options::default();
         result.existing_pier = Some(pier);
         result.tty = Some(false);
         result
     }
 
     pub fn launch_from_keyfile(keyfile: &'a Path, pier: &'a Path) -> Self {
-        let result = Options::default();
+        let mut result = Options::default();
         result.new_pier = Some(pier);
         result.keyfile = Some(keyfile);
         result.tty = Some(false);

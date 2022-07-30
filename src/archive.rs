@@ -10,14 +10,14 @@ use tokio::task;
 
 pub fn extract_file_sync(src_path: &SPath, dst_path: &SPath, options: &ExtractOptions) -> Result<usize> {
     let mut src_builder = reader::Builder::new();
-    src_builder.support_compression(ReadCompression::All);
-    src_builder.support_filter(ReadFilter::All);
-    src_builder.support_format(ReadFormat::All);
+    src_builder.support_compression(ReadCompression::All)?;
+    src_builder.support_filter(ReadFilter::All)?;
+    src_builder.support_format(ReadFormat::All)?;
 
     let mut src = src_builder.open_file(src_path)?;
 
     let dst = writer::Disk::new();
-    dst.set_options(options);
+    dst.set_options(options)?;
 
     // The libarchive crate uses &str in the function signature, and then immediately converts it back to an OsStr.
     // No reason to reject destination paths that happen to not be valid utf8 here.
