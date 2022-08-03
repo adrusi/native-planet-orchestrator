@@ -8,22 +8,6 @@ use pin_project_lite::pin_project;
 use std::task::Poll;
 use sha2::Digest;
 
-#[async_trait]
-pub trait AsyncDrop {
-    async fn async_drop_result(&mut self) -> Result<()> {
-        Ok(())
-    }
-
-    async fn async_drop(&mut self) {
-        match self.async_drop_result().await {
-            Ok(_) => {},
-            Err(err) => {
-                log::error!("error encountered in async_drop(): {}", err);
-            }
-        }
-    }
-}
-
 pub trait MyStreamExt : Stream {
     fn into_checksum_verify<D: Digest>(
         self,

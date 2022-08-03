@@ -1,6 +1,5 @@
 #[allow(unused_imports)] use crate::prelude::*;
 
-use async_std::fs;
 use async_std::io;
 use async_std::path::{Path, PathBuf};
 use serde::de::{self, Visitor};
@@ -217,29 +216,31 @@ impl Version {
     }
 
     pub fn binary_name(self) -> String {
-        format!("urbit-{}", self)
+        // format!("urbit-{}", self)
+        "urbit-{}".to_owned()
     }
 
     pub fn binary_path(self) -> PathBuf {
-        let mut result = RUNTIME_HOME.clone();
-        result.push(Path::new(&self.binary_name()));
-        result
+        // let mut result = RUNTIME_HOME.clone();
+        // result.push(Path::new(&self.binary_name()));
+        // result
+        PathBuf::from("/usr/bin/urbit")
     }
 
     async fn ensure_installed(self) -> Result<()> {
-        let binary_path = self.binary_path();
-        if binary_path.exists().await {
-            return Ok(());
-        }
+        // let binary_path = self.binary_path();
+        // if binary_path.exists().await {
+        //     return Ok(());
+        // }
 
-        let mut instream = self.fetch().await?;
-        let mut outfile = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&binary_path)
-            .await?;
+        // let mut instream = self.fetch().await?;
+        // let mut outfile = fs::OpenOptions::new()
+        //     .create_new(true)
+        //     .write(true)
+        //     .open(&binary_path)
+        //     .await?;
 
-        io::copy(&mut instream, &mut outfile).await?;
+        // io::copy(&mut instream, &mut outfile).await?;
 
         Ok(())
     }
@@ -273,6 +274,10 @@ impl Version {
         }
         match options.http_port {
             Some(port) => { cmd.arg("--http-port").arg(port.to_string()); },
+            _ => {},
+        }
+        match options.dock {
+            Some(false) => { cmd.arg("--no-dock"); },
             _ => {},
         }
         match options.tty {
@@ -450,6 +455,7 @@ pub struct Options<'a> {
     name: Option<&'a str>,
     ames_port: Option<u16>,
     http_port: Option<u16>,
+    dock: Option<bool>,
     tty: Option<bool>,
     existing_pier: Option<&'a Path>,
 }
@@ -459,14 +465,35 @@ impl<'a> Options<'a> {
         let mut result = Options::default();
         result.existing_pier = Some(pier);
         result.tty = Some(false);
+        result.dock = Some(false);
         result
     }
 
-    pub fn launch_from_keyfile(keyfile: &'a Path, pier: &'a Path) -> Self {
+    pub fn launch_from_keyfile(keyfile: &'a Path, name: &'a str, pier: &'a Path) -> Self {
         let mut result = Options::default();
         result.new_pier = Some(pier);
         result.keyfile = Some(keyfile);
+        result.name = Some(name);
         result.tty = Some(false);
+        result.dock = Some(false);
         result
+    }
+
+    pub fn launch_new_comet(pier: &'a Path) -> Self {
+        let mut result = Options::default();
+        result.new_pier = Some(pier);
+        result.tty = Some(false);
+        result.dock = Some(false);
+        result
+    }
+
+    pub fn ames_port(&mut self, p: u16) -> &mut Self {
+        self.ames_port = Some(p);
+        self
+    }
+
+    pub fn http_port(&mut self, p: u16) -> &mut Self {
+        self.http_port = Some(p);
+        self
     }
 }

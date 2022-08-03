@@ -5,20 +5,23 @@ use async_std::io;
 use async_std::path::{Path, PathBuf};
 use libarchive::archive::ExtractOption;
 use serde::{Deserialize, Serialize};
+use std::env;
 use std::error::Error as StdError;
 use std::fmt::Display;
+use std::ops::Range;
+use tokio::process;
 
 use crate::archive;
 use crate::filelock::FileLock;
+use crate::net_util::TcpPortIssuer;
 use crate::runtime;
 
 pub use harbor_private::{HARBOR, Harbor, HarborBuf};
 
 mod harbor_private {
-    use anyhow::Result;
+    #[allow(unused_imports)] use crate::prelude::*;
+
     use async_std::fs::DirEntry;
-    use futures::prelude::*;
-    use lazy_static::lazy_static;
     use std::borrow::Borrow;
     use std::env;
     use std::io;
@@ -39,26 +42,26 @@ mod harbor_private {
             unsafe { &*(path.as_ref() as *const Path as *const Harbor) }
         }
 
-        pub async fn port_path(&self) -> PathBuf {
+        pub async fn port_path(&self) -> Result<PathBuf> {
             let mut result = self.0.to_owned();
             result.push(Path::new("port"));
 
             if !result.is_dir().await {
-                panic!("Harbor port path is not a directory: {}", result.to_string_lossy())
+                bail!("Harbor port path is not a directory: {}", result.to_string_lossy())
             }
 
-            result
+            Ok(result)
         }
 
-        pub async fn dry_dock_path(&self) -> PathBuf {
+        pub async fn dry_dock_path(&self) -> Result<PathBuf> {
             let mut result = self.0.to_owned();
             result.push(Path::new("dry_dock"));
 
             if !result.is_dir().await {
-                panic!("Harbor dry dock path is not a directory: {}", result.to_string_lossy())
+                bail!("Harbor dry dock path is not a directory: {}", result.to_string_lossy())
             }
 
-            result
+            Ok(result)
         }
 
         pub fn as_path(&self) -> &Path {
@@ -66,7 +69,7 @@ mod harbor_private {
         }
 
         pub async fn piers_in_port(&self) -> Result<Vec<String>> {
-            let directory_listing = self.port_path().await.read_dir().await?;
+            let directory_listing = self.port_path().await?.read_dir().await?;
 
             let mut result: Vec<String> = Vec::new();
 
@@ -146,6 +149,16 @@ mod harbor_private {
     }
 }
 
+lazy_static! {
+    pub static ref HTTP_PORT_RANGE: Range<u16> = env::var_os("NUCLEUS_HTTP_PORT_RANGE")
+        .map(|s| s.to_str().unwrap().parse::<MyRange<u16>>().unwrap().inner)
+        .unwrap_or(8300..8400);
+
+    pub static ref AMES_PORT_RANGE: Range<u16> = env::var_os("NUCLEUS_AMES_PORT_RANGE")
+        .map(|s| s.to_str().unwrap().parse::<MyRange<u16>>().unwrap().inner)
+        .unwrap_or(4300..4400);
+}
+
 #[derive(Debug)]
 pub struct InvalidPierArchiveError;
 
@@ -161,9 +174,13 @@ fn find_extracted_pier(_unpack_path: &Path) -> Option<PathBuf> {
     todo!();
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PierConfig {
     runtime_version: runtime::Version,
+    id: Uuid,
+    #[serde(rename = "@p")]
+    name: Option<String>,
 }
 
 /// A PierState represents the data for an Urbit ship. Specifically it is a unique handle to the directory where all
@@ -176,113 +193,143 @@ pub struct PierConfig {
 /// be released if you forget, but synchronously, blocking the whole thread and tanking performance.
 #[derive(Debug)]
 pub struct PierState {
-    filelock: Option<FileLock>,
-    config: Option<PierConfig>,
+    id: Uuid,
+    name: Option<String>,
+    config: PierConfig,
     meta_path: PathBuf,
     dry_docked: bool,
-    name: String,
+    /// true iff there's a "pier" directory
     initialized: bool,
-    running: bool,
+    /// false if initialized, used to indicate whether to perform the initial launch with a keyfile or as a comet
+    comet: bool,
+    filelock: FileLock,
 }
 
 impl PierState {
-    async fn prepare_for_load(mut path: PathBuf, name: &str) -> Result<Self> {
-        path.push(name);
+    async fn load_from_port(path: &Path, name: &str) -> Result<Self> {
+        let mut meta_path = HARBOR.port_path().await?;
+        meta_path.push(name);
 
-        if !path.is_dir().await {
-            bail!(
-                "Pier '{}' does not exist in harbor port: {}",
-                name,
-                HARBOR.as_path().to_string_lossy(),
-            )
+        if !meta_path.is_dir().await {
+            bail!("Pier '{}' does not exist in harbor port", name);
+        }
+
+        let filelock = FileLock::try_acquire(
+            Self::lockfile_path_given_meta(meta_path.clone())
+        ).await?;
+        let filelock = filelock.ok_or_else(|| anyhow!(
+            "Attempted to acquire multiple handles for the same pier: {}",
+            meta_path.to_string_lossy(),
+        ))?;
+
+        let config = Self::load_config(&meta_path).await?;
+
+        match config.name {
+            None => {
+                bail!("attempted to load uninitialized pier from port; only dry dock piers may be uninitialized")
+            },
+            Some(ref config_name) => {
+                if config_name != name {
+                    bail!("mismatch between name of pier directory and the @p field in its config");
+                }
+            },
+        }
+
+        let config = Self::load_config(&meta_path).await?;
+
+        let result = Self {
+            id: config.id,
+            name: Some(name.to_owned()),
+            meta_path,
+            filelock,
+            config,
+            dry_docked: false,
+            comet: false,
+            initialized: true,
+        };
+
+        if !result.pier_path().exists().await {
+            bail!("attempted to load uninitialized pier from port; only dry dock piers may be uninitialized")
+        }
+
+        Ok(result)
+    }
+
+    async fn load_from_dry_dock(path: &Path, id: Uuid) -> Result<Self> {
+        let mut meta_path = HARBOR.dry_dock_path().await?;
+        meta_path.push(format!("{}", id.hyphenated()));
+
+        if !meta_path.is_dir().await {
+            bail!("Pier '{}' does not exist in harbor dry dock", id.hyphenated());
+        }
+
+        let filelock = FileLock::try_acquire(
+            Self::lockfile_path_given_meta(meta_path.clone())
+        ).await?;
+        let filelock = filelock.ok_or_else(|| anyhow!(
+            "Attempted to acquire multiple handles for the same pier: {}",
+            meta_path.to_string_lossy(),
+        ))?;
+
+        let config = Self::load_config(&meta_path).await?;
+
+        if config.id != id {
+            bail!("mismatch between id of pier directory and the id field in its config");
         }
 
         let mut result = Self {
-            filelock: None,
-            config: None,
-            meta_path: Self::determine_meta_path(name, false).await,
-            dry_docked: false,
-            name: name.to_owned(),
+            id: id,
+            name: config.name.clone(),
+            meta_path,
+            filelock,
+            config: config,
+            dry_docked: true,
+            comet: false,
             initialized: false,
-            running: false,
         };
 
-        if result.pier_path().exists().await {
-            result.initialized = true;
-        }
+        result.initialized = result.pier_path().exists().await;
 
         Ok(result)
     }
 
-    async fn load_config(&mut self) -> Result<()> {
-        let config_buf = fs::read(self.config_path()).await?;
-        self.config = Some(serde_json::from_slice(&config_buf)?);
-        Ok(())
-    }
-
-    pub async fn try_load_from_port(name: &str) -> Result<Self> {
-        Self::try_load_from_path(HARBOR.port_path().await, name).await
-    }
-
-    pub async fn try_load_from_dry_dock(name: &str) -> Result<Self> {
-        Self::try_load_from_path(HARBOR.dry_dock_path().await, name).await
-    }
-
-    async fn try_load_from_path(path: PathBuf, name: &str) -> Result<Self> {
-        let mut result = PierState::prepare_for_load(path, name).await?;
-
-        let filelock = FileLock::try_acquire(result.lockfile_path()).await?;
-        if filelock.is_none() {
-            bail!(
-                "Attempted to acquire multiple handles for the same pier: {}",
-                result.meta_path().to_string_lossy(),
-            )
-        }
-
-        result.filelock = filelock;
-
-        result.load_config().await?;
-
-        Ok(result)
-    }
-
-    pub async fn load_from_port(name: &str) -> Result<Self> {
-        Self::load_from_path(HARBOR.port_path().await, name).await
-    }
-
-    pub async fn load_from_dry_dock(name: &str) -> Result<Self> {
-        Self::load_from_path(HARBOR.dry_dock_path().await, name).await
-    }
-
-    async fn load_from_path(path: PathBuf, name: &str) -> Result<Self> {
-        let mut result = PierState::prepare_for_load(path, name).await?;
-
-        result.filelock = Some(
-            FileLock::acquire(result.lockfile_path()).await?
-        );
-
-        result.load_config().await?;
-
-        Ok(result)
+    async fn load_config(meta_path: &Path) -> Result<PierConfig> {
+        let config_buf = fs::read(Self::config_path_given_meta(meta_path.to_owned())).await?;
+        Ok(serde_json::from_slice(&config_buf)?)
     }
 
     pub async fn new_from_keyfile<In: io::Read + Unpin>(
         key_infile: &mut In,
-        config: Option<PierConfig>
+        name: String,
     ) -> Result<Self> {
-        let name = Uuid::new_v4().hyphenated().to_string();
+        let id = Uuid::new_v4();
 
-        let mut result = Self {
-            filelock: None,
-            config: Some(config.unwrap_or_default()),
-            meta_path: Self::determine_meta_path(&name, true).await,
-            dry_docked: true,
-            name,
-            initialized: false,
-            running: false,
+        let mut meta_path = HARBOR.dry_dock_path().await?;
+        meta_path.push(format!("{}", id.hyphenated()));
+
+        fs::create_dir(&meta_path).await?;
+
+        let filelock = FileLock::try_acquire(
+            Self::lockfile_path_given_meta(meta_path.clone())
+        ).await?;
+        let filelock = filelock.ok_or_else(|| anyhow!("failed to acquire lock on newly created pier"))?;
+
+        let config = PierConfig {
+            id: id,
+            name: Some(name.clone()),
+            runtime_version: runtime::Version::default(),
         };
 
-        fs::create_dir(result.meta_path()).await?;
+        let result = Self {
+            id,
+            name: Some(name),
+            filelock,
+            config,
+            meta_path,
+            dry_docked: true,
+            comet: false,
+            initialized: false,
+        };
 
         let mut key_outfile = fs::OpenOptions::new()
             .read(false)
@@ -293,34 +340,46 @@ impl PierState {
             .await?;
         io::copy(key_infile, &mut key_outfile).await?;
 
-        result.filelock = FileLock::try_acquire(result.lockfile_path()).await?
-            .ok_or(anyhow!("failed to acquire lock on newly created pier"))?
-            .into();
-
         Ok(result)
     }
 
     pub async fn new_from_pier_archive<In>(
         archive_infile: &mut In,
-        config: Option<PierConfig>,
     ) -> Result<Self>
         where In: io::Read + Unpin
     {
-        let name = Uuid::new_v4().hyphenated().to_string();
+        let id = Uuid::new_v4();
+
+        let mut meta_path = HARBOR.dry_dock_path().await?;
+        meta_path.push(format!("{}", id.hyphenated()));
+
+        fs::create_dir(&meta_path).await?;
+
+        let filelock = FileLock::try_acquire(
+            Self::lockfile_path_given_meta(meta_path.clone())
+        ).await?;
+        let filelock = filelock.ok_or_else(|| anyhow!("failed to acquire lock on newly created pier"))?;
+
+        let config = PierConfig {
+            id: id,
+            name: None,
+            runtime_version: runtime::Version::default(),
+        };
 
         let result = Self {
-            filelock: None,
-            config: Some(config.unwrap_or_default()),
-            meta_path: Self::determine_meta_path(&name, true).await,
+            id,
+            name: None,
+            filelock,
+            config,
+            meta_path,
             dry_docked: true,
-            name,
-            initialized: true,
-            running: false,
+            comet: false,
+            initialized: false,
         };
 
         let archive_path = result.archive_path();
         let unpack_path = result.unpack_path();
-        let result = Self::new_from_pier_archive_inner(archive_infile, result, &archive_path, &unpack_path).await;
+        let mut result = Self::new_from_pier_archive_inner(archive_infile, result, &archive_path, &unpack_path).await?;
 
         if archive_path.is_file().await {
             _ = fs::remove_file(&archive_path).await;
@@ -329,7 +388,9 @@ impl PierState {
             _ = fs::remove_dir_all(&unpack_path).await;
         }
 
-        result
+        result.initialized = true;
+
+        Ok(result)
     }
 
     // All the business logic is here, split out to allow simpler cleanup in the face of no async Drop.
@@ -342,7 +403,7 @@ impl PierState {
     ) -> Result<Self>
         where In: io::Read + Unpin
     {
-        fs::create_dir(result.meta_path()).await?;
+        fs::create_dir(&result.meta_path).await?;
 
         let mut archive_outfile = fs::OpenOptions::new()
             .read(false)
@@ -373,159 +434,214 @@ impl PierState {
         Ok(result)
     }
 
-    pub fn config(&self) -> Option<&PierConfig> {
-        self.config.as_ref()
+    pub async fn new_comet(
+        config: Option<PierConfig>,
+    ) -> Result<Self> {
+        let id = Uuid::new_v4();
+
+        let mut meta_path = HARBOR.dry_dock_path().await?;
+        meta_path.push(format!("{}", id.hyphenated()));
+
+        fs::create_dir(&meta_path).await?;
+
+        let filelock = FileLock::try_acquire(
+            Self::lockfile_path_given_meta(meta_path.clone())
+        ).await?;
+        let filelock = filelock.ok_or_else(|| anyhow!("failed to acquire lock on newly created pier"))?;
+
+        let config = PierConfig {
+            id: id,
+            name: None,
+            runtime_version: runtime::Version::default(),
+        };
+
+        let result = Self {
+            id,
+            name: None,
+            filelock,
+            config,
+            meta_path,
+            dry_docked: true,
+            comet: true,
+            initialized: false,
+        };
+
+        Ok(result)
+    }
+
+    pub fn config(&self) -> &PierConfig {
+        &self.config
     }
 
     pub fn dry_docked(&self) -> bool {
         self.dry_docked
     }
 
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    pub fn running(&self) -> bool {
-        self.running
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
     }
 
     pub fn initialized(&self) -> bool {
         self.initialized
     }
 
-    async fn determine_meta_path(name: &str, dry_docked: bool) -> PathBuf {
-        let parent_path = if dry_docked {
-            HARBOR.dry_dock_path().await
-        } else {
-            HARBOR.port_path().await
-        };
-
-        let mut result = parent_path.to_owned();
-        result.push(Path::new(name));
-
-        result
+    fn config_path_given_meta(mut meta_path: PathBuf) -> PathBuf {
+        meta_path.push("config.json");
+        meta_path
     }
 
-    fn meta_path(&self) -> PathBuf {
-        self.meta_path.clone()
+    fn lockfile_path_given_meta(mut meta_path: PathBuf) -> PathBuf {
+        meta_path.push("lockfile");
+        meta_path
     }
 
     fn pier_path(&self) -> PathBuf {
-        let mut result = self.meta_path();
-        result.push(Path::new("pier"));
-        result
-    }
-
-    fn config_path(&self) -> PathBuf {
-        let mut result = self.meta_path();
-        result.push("config.json");
-        result
-    }
-
-    fn lockfile_path(&self) -> PathBuf {
-        let mut result = self.meta_path();
-        result.push("lockfile");
-        result
+        self.meta_path.join("pier")
     }
 
     fn keyfile_path(&self) -> PathBuf {
-        let mut result = self.meta_path();
-        result.push("keyfile");
-        result
+        self.meta_path.join("keyfile")
     }
 
     fn archive_path(&self) -> PathBuf {
-        let mut result = self.meta_path();
-        result.push("archive");
-        result
+        self.meta_path.join("archive")
     }
 
     fn unpack_path(&self) -> PathBuf {
-        let mut result = self.meta_path();
-        result.push("unpack");
-        result
+        self.meta_path.join("unpack")
     }
 
-    pub async fn release_from_dry_dock(&mut self, new_name: String) -> Result<()> {
-        if self.running {
-            bail!(
-                "cannot release running ship from dry dock: {} (new name {})",
-                self.name, new_name,
-            )
-        }
-        if !self.initialized {
-            bail!(
-                "cannot release uninitialized ship from dry dock: {} (new name {})",
-                self.name, new_name,
-            )
-        }
+    pub async fn release_from_dry_dock(
+        mut self,
+        http_port_issuer: &mut TcpPortIssuer,
+        ames_port_issuer: &mut TcpPortIssuer,
+    ) -> Result<Self> {
+        let mut ship = self.launch(http_port_issuer, ames_port_issuer).await?;
+        ship.pier.name = Some(ship.dojo("our").await?.trim().to_owned());
+        self = ship.shutdown().await?;
 
-        let src_path = self.meta_path();
-        let mut dst_path = HARBOR.port_path().await;
-        dst_path.push(&new_name);
+        let mut new_meta_path = HARBOR.port_path().await?;
+        new_meta_path.push(self.name.as_ref().unwrap());
 
-        fs::rename(src_path, dst_path).await?;
+        let old_meta_path = self.meta_path.clone();
+        self.meta_path = new_meta_path;
 
-        self.name = new_name;
+        fs::rename(&old_meta_path, &self.meta_path).await?;
+        self.dry_docked = false;
 
-        Ok(())
+        Ok(self)
     }
-}
 
-#[async_trait]
-impl AsyncDrop for PierState {
-    async fn async_drop_result(&mut self) -> Result<()> {
-        match self.config {
-            None => {},
-            Some(ref config) => {
-                let config_buf = serde_json::to_vec(config)?;
-                fs::write(self.config_path(), &config_buf).await?;
-                self.config = None;
-            },
-        }
+    pub async fn launch(
+        mut self,
+        http_port_issuer: &mut TcpPortIssuer,
+        ames_port_issuer: &mut TcpPortIssuer,
+    ) -> Result<Ship> {
 
-        let filelock = self.filelock.take();
-        match filelock {
-            None => Ok(()),
-            Some(filelock) => filelock.release().await,
-        }
+        let ames_port = ames_port_issuer.get_port().await?;
+        let http_port = http_port_issuer.get_port().await?;
+
+        let proc = if self.initialized {
+            self.config.runtime_version.exec(
+                runtime::Options::launch_existing_pier(&self.pier_path())
+                    .http_port(http_port)
+                    .ames_port(ames_port)
+            ).await?
+        } else {
+            if self.comet {
+                self.config.runtime_version.exec(
+                    runtime::Options::launch_new_comet(&self.pier_path())
+                        .http_port(http_port)
+                        .ames_port(ames_port)
+                ).await?
+            } else {
+                let name = self.name.as_ref().unwrap();
+                self.config.runtime_version.exec(
+                    runtime::Options::launch_from_keyfile(&self.keyfile_path(), name, &self.pier_path())
+                        .http_port(http_port)
+                        .ames_port(ames_port)
+                ).await?
+            }
+        };
+
+        self.initialized = true;
+
+        Ok(Ship::new(self, proc, ames_port, http_port).await?)
     }
 }
 
 impl Drop for PierState {
     fn drop(&mut self) {
-        match self.config {
-            None => {},
-            Some(ref config) => {
-                log::error!(
-                    "PierState not finalized before being dropped, performing sync IO in async context to clean up"
-                );
-
-                let config_file = std::fs::OpenOptions::new()
-                    .create(true)
-                    .read(false)
-                    .write(true)
-                    .truncate(true)
-                    .open(self.config_path());
-                let config_file = match config_file {
-                    Ok(f) => f,
-                    Err(err) => {
-                        log::error!("encountered error during PierState cleanup: {}", err);
-                        return
-                    },
-                };
-
-                match serde_json::to_writer(config_file, config) {
-                    Ok(_) => {},
-                    Err(err) => {
-                        log::error!("encountered error during PierState cleanup: {}", err);
-                    }
-                }
+        let config_file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(false)
+            .write(true)
+            .truncate(true)
+            .open(PierState::config_path_given_meta(self.meta_path.clone()));
+        let config_file = match config_file {
+            Ok(f) => f,
+            Err(err) => {
+                log::error!("encountered error during PierState cleanup: {}", err);
+                return
             },
-        }
+        };
+
+        _ = serde_json::to_writer(config_file, &self.config).unwrap_or_else(|err| {
+            log::error!("encountered error during PierState cleanup: {}", err);
+        });
     }
 }
 
 pub struct Ship {
-    pub pier: PierState,
+    pier: PierState,
+    proc: process::Child,
+    http_port: u16,
+    ames_port: u16,
+    lens_port: u16,
+}
+
+impl Ship {
+    async fn new(pier: PierState, proc: process::Child, http_port: u16, ames_port: u16) -> Result<Self> {
+        let portsfile_path = pier.pier_path().join(&Path::new(".http.ports"));
+        let portsdesc = fs::read_to_string(&portsfile_path).await?;
+
+        let lens_port: u16 = portsdesc.lines()
+            .filter(|line| line.ends_with("loopback"))
+            .map(|line| line.split_ascii_whitespace().nth(0))
+            .nth(0)
+            .flatten()
+            .and_then(|port_str| port_str.parse().ok())
+            .ok_or(anyhow!("could not decode .http.ports file: {}", portsfile_path.to_string_lossy()))?;
+
+        Ok(Ship {
+            pier, proc, http_port, ames_port,
+            lens_port,
+        })
+    }
+
+    pub async fn shutdown(mut self) -> Result<PierState> {
+        self.proc.kill().await?;
+        Ok(self.pier)
+    }
+
+    pub async fn dojo(&self, eval_str: &str) -> Result<String> {
+        let res_json = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{}", self.lens_port))
+            .header("Content-type", "application/json")
+            .json(&serde_json::json!({
+                "source": { "dojo": eval_str },
+                "sink": { "stdout": null },
+            }))
+            .send()
+            .await?
+            .bytes()
+            .await?;
+
+        let res_json: serde_json::Value = serde_json::from_slice(&res_json)?;
+
+        match res_json {
+            serde_json::Value::String(s) => Ok(s),
+            _ => bail!("invalid response from urbit"),
+        }
+    }
 }
